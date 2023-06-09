@@ -20,6 +20,7 @@ import (
 	"github.com/cloudflare/tableflip"
 	"github.com/gorilla/mux"
 	"os"
+	"runtime"
 )
 
 var (
@@ -161,11 +162,6 @@ type Server struct {
 
 // NewServer creates an HTTP server by options.
 func NewServer(opts ...ServerOption) *Server {
-	upg, err := tableflip.New(tableflip.Options{})
-	if err != nil {
-		panic(err)
-	}
-
 	srv := &Server{
 		network:     "tcp",
 		address:     ":0",
@@ -178,8 +174,15 @@ func NewServer(opts ...ServerOption) *Server {
 		ene:         DefaultErrorEncoder,
 		strictSlash: true,
 		router:      mux.NewRouter(),
-		upg:         upg,
 	}
+	if runtime.GOOS != "windows" {
+		upg, err := tableflip.New(tableflip.Options{})
+		if err != nil {
+			panic(err)
+		}
+		srv.upg = upg
+	}
+
 	for _, o := range opts {
 		o(srv)
 	}
@@ -303,81 +306,103 @@ func (s *Server) Endpoint() (*url.URL, error) {
 
 // Start start the HTTP server.
 func (s *Server) Start(ctx context.Context) error {
-	//go func() {
-	//	// 核心的 Upgrade 调用
-	//	sig := make(chan os.Signal, 1)
-	//	signal.Notify(sig, syscall.SIGHUP)
-	//	for range sig {
-	//		// 核心的 Upgrade 调用
-	//		err := s.upg.Upgrade()
-	//		if err != nil {
-	//			//log.Println("Upgrade failed:", err)
-	//			log.Infof("Upgrade failed:", err)
-	//		}
-	//	}
-	//}()
-	if err := s.listenAndEndpoint(); err != nil {
-		return err
-	}
-	s.BaseContext = func(net.Listener) context.Context {
-		return ctx
-	}
-	log.Infof("[HTTP] server listening on: %s", s.lis.Addr().String())
-	var err error
-	go func() {
+	if runtime.GOOS != "windows" {
+		if err := s.listenAndEndpoint(); err != nil {
+			return err
+		}
+		s.BaseContext = func(net.Listener) context.Context {
+			return ctx
+		}
+		log.Infof("[HTTP] server listening on: %s", s.lis.Addr().String())
+		var err error
+		go func() {
+			if s.tlsConf != nil {
+				err = s.ServeTLS(s.lis, "", "")
+			} else {
+				err = s.Serve(s.lis)
+			}
+			if !errors.Is(err, http.ErrServerClosed) {
+				log.Infof("HTTP server:", err)
+			}
+		}()
+		if err = s.upg.Ready(); err != nil {
+			panic(err)
+		}
+		return nil
+	} else {
+		if err := s.listenAndEndpoint(); err != nil {
+			return err
+		}
+		s.BaseContext = func(net.Listener) context.Context {
+			return ctx
+		}
+		log.Infof("[HTTP] server listening on: %s", s.lis.Addr().String())
+		var err error
 		if s.tlsConf != nil {
 			err = s.ServeTLS(s.lis, "", "")
 		} else {
 			err = s.Serve(s.lis)
 		}
 		if !errors.Is(err, http.ErrServerClosed) {
-			log.Infof("HTTP server:", err)
+			return err
 		}
-	}()
-	log.Infof("888888")
-	if err = s.upg.Ready(); err != nil {
-		panic(err)
+		if err = s.upg.Ready(); err != nil {
+			panic(err)
+		}
+		return nil
 	}
-	log.Infof("999999")
-	return nil
 }
 
 // Stop stop the HTTP server.
 func (s *Server) Stop(ctx context.Context) error {
-	defer s.upg.Stop()
-	go func() {
-		// 核心的 Upgrade 调用
-		err := s.upg.Upgrade()
-		if err != nil {
-			//log.Println("Upgrade failed:", err)
-			log.Infof("Upgrade failed:", err)
-		}
-	}()
-	<-s.upg.Exit()
-	// 给老进程的退出设置一个 30s 的超时时间，保证老进程的退出
-	time.AfterFunc(3*time.Second, func() {
-		//log.Println("Graceful shutdown timed out")
-		log.Infof("Graceful shutdown timed out")
-		os.Exit(1)
-	})
-	log.Info("[HTTP] server stopping")
-	return s.Shutdown(ctx)
+	if runtime.GOOS != "windows" {
+		log.Info("[HTTP] server stopping")
+		return s.Shutdown(ctx)
+	} else {
+		defer s.upg.Stop()
+		go func() {
+			// 核心的 Upgrade 调用
+			err := s.upg.Upgrade()
+			if err != nil {
+				//log.Println("Upgrade failed:", err)
+				log.Infof("Upgrade failed:", err)
+			}
+		}()
+		<-s.upg.Exit()
+		// 给老进程的退出设置一个 30s 的超时时间，保证老进程的退出
+		time.AfterFunc(3*time.Second, func() {
+			//log.Println("Graceful shutdown timed out")
+			log.Infof("Graceful shutdown timed out")
+			os.Exit(1)
+		})
+		log.Info("[HTTP] server stopping")
+		return s.Shutdown(ctx)
+	}
 }
 
 func (s *Server) listenAndEndpoint() error {
 	if s.lis == nil {
-		// 注意必须使用 upg.Listen 对端口进行监听
-		lis, err := s.upg.Listen("tcp", ":8001")
-		if err != nil {
-			s.err = err
-			return err
+		if runtime.GOOS != "windows" {
+			// 注意必须使用 upg.Listen 对端口进行监听
+			lis, err := s.upg.Listen("tcp", ":8001")
+			if err != nil {
+				s.err = err
+				return err
+			}
+			//lis, err := net.Listen(s.network, s.address)
+			if err != nil {
+				s.err = err
+				return err
+			}
+			s.lis = lis
+		} else {
+			lis, err := net.Listen(s.network, s.address)
+			if err != nil {
+				s.err = err
+				return err
+			}
+			s.lis = lis
 		}
-		//lis, err := net.Listen(s.network, s.address)
-		if err != nil {
-			s.err = err
-			return err
-		}
-		s.lis = lis
 	}
 	if s.endpoint == nil {
 		addr, err := host.Extract(s.address, s.lis)
