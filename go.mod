@@ -3,6 +3,7 @@ module github.com/go-kratos/kratos/v2
 go 1.18
 
 require (
+	github.com/cloudflare/tableflip v1.2.3
 	github.com/fsnotify/fsnotify v1.5.4
 	github.com/go-kratos/aegis v0.2.0
 	github.com/go-playground/form/v4 v4.2.0
